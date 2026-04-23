@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import '../controllers/vpn_controller.dart';
-import '../widgets/packet_card.dart';
+import 'package:redand/controllers/vpn_controller.dart';
+import 'package:redand/widgets/packet_card.dart';
 
 class SimpleHomeView extends StatelessWidget {
   const SimpleHomeView({super.key});

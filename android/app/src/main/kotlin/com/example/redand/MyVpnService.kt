@@ -13,7 +13,12 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.InetAddress
 
+
 class MyVpnService : VpnService() {
+
+    // Permisos de tráfico
+    private var allowIn = true
+    private var allowOut = true
 
     private var running = false
     private var thread: Thread? = null
@@ -21,13 +26,13 @@ class MyVpnService : VpnService() {
     private var outputStream: FileOutputStream? = null
 
     // VPN Configuration parameters
-    private var bufferSize = 32767
-    private var vpnAddress = "10.0.0.2"
-    private var vpnPrefixLength = 24
-    private var dnsServer = "8.8.8.8"
-    private var routeAddress = "0.0.0.0"
-    private var routePrefixLength = 0
-    private var sessionName = "RedAnd VPN"
+private var bufferSize = 65535              // Máximo tamaño de paquete IP
+private var vpnAddress = "10.0.0.2"         // IP virtual del TUN
+private var vpnPrefixLength = 32            // IMPORTANTE: solo esta IP (no red completa)
+private var dnsServer = "8.8.8.8"           // DNS (puedes cambiarlo)
+private var routeAddress = "0.0.0.0"        // Captura todo el tráfico
+private var routePrefixLength = 0           // 0 = todo (default route)
+private var sessionName = "RedAnd Sniffer"
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d("MyVpnService", "onStartCommand called")
@@ -41,6 +46,9 @@ class MyVpnService : VpnService() {
             routeAddress = it.getStringExtra("routeAddress") ?: "0.0.0.0"
             routePrefixLength = it.getIntExtra("routePrefixLength", 0)
             sessionName = it.getStringExtra("sessionName") ?: "RedAnd VPN"
+            // Permisos de tráfico (entrada/salida)
+            allowIn = it.getBooleanExtra("allowIn", true)
+            allowOut = it.getBooleanExtra("allowOut", true)
         }
 
         Log.d("MyVpnService", "Configuration: bufferSize=$bufferSize, vpnAddress=$vpnAddress, sessionName=$sessionName")
@@ -77,6 +85,7 @@ class MyVpnService : VpnService() {
 
     private fun runVpn() {
         Log.d("MyVpnService", "runVpn started")
+
         val builder = Builder()
             .addAddress(vpnAddress, vpnPrefixLength)
             .addDnsServer(dnsServer)
@@ -96,19 +105,32 @@ class MyVpnService : VpnService() {
 
         val buffer = ByteArray(bufferSize)
 
+
         while (running) {
             try {
                 val length = inputStream?.read(buffer) ?: -1
                 if (length > 0) {
-                    Log.d("MyVpnService", "Received packet length: $length")
-                    // Procesar el paquete IP
                     val packetInfo = parseIpPacket(buffer, length)
+                    var allow = true
                     if (packetInfo != null) {
-                        Log.d("MyVpnService", "Parsed packet: $packetInfo")
-                        MainActivity.sendPacketInfo(packetInfo)
+                        val src = packetInfo["source"] as? String ?: ""
+                        val dst = packetInfo["destination"] as? String ?: ""
+                        val protocol = packetInfo["protocol"] as? Int ?: -1
+                        // Determinar dirección
+                        val isOutgoing = src == vpnAddress
+                        val isIncoming = dst == vpnAddress
+                        // Permitir según configuración
+                        allow = (isOutgoing && allowOut) || (isIncoming && allowIn)
+                        Log.d("MyVpnService", "Packet direction: ${if (isOutgoing) "OUT" else if (isIncoming) "IN" else "UNK"}, allow=$allow")
+                        if (allow) {
+                            MainActivity.sendPacketInfo(packetInfo)
+                        }
                     }
-                    // Para outgoing, escribir de vuelta si es necesario
-                    outputStream?.write(buffer, 0, length)
+                    // Si no está permitido, descartar el paquete
+                    if (allow) {
+                        // Aquí podrías reenviar el paquete si implementas forwarding
+                        // outputStream?.write(buffer, 0, length)
+                    }
                 } else if (length == -1) {
                     // Stream closed
                     break

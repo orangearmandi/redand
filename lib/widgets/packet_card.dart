@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import '../models/packet.dart';
-import '../views/packet_detail_view.dart';
+import '../views/details/packet_detail_view.dart';
 
 class PacketCard extends StatelessWidget {
   final Packet packet;

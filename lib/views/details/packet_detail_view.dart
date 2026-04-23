@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import '../models/packet.dart';
+import 'package:redand/models/packet.dart';
 
 class PacketDetailView extends StatefulWidget {
   final Packet packet;

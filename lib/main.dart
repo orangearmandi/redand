@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'controllers/vpn_controller.dart';
-import 'views/home_view.dart';
-import 'views/simple_home_view.dart';
-import 'views/settings_view.dart';
+import 'views/main/home_view.dart';
+import 'views/simple/simple_home_view.dart';
+import 'views/settings/settings_view.dart';
 import 'views/network_info/network_info_view.dart';
 import 'views/ping/ping_view.dart';
 import 'views/multicast_dns/multicast_dns_view.dart';
