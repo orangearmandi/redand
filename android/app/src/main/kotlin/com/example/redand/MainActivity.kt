@@ -81,8 +81,38 @@ class MainActivity : FlutterActivity() {
                 }
                 "stopVpn" -> {
                     Log.d("MainActivity", "Stopping VPN service")
-                    stopService(Intent(this, MyVpnService::class.java))
-                    result.success(true)
+                    try {
+                        // Método 1: Intentar detención normal primero
+                        Log.d("MainActivity", "Attempting normal stop")
+                        val serviceIntent = Intent(this, MyVpnService::class.java).apply {
+                            action = MyVpnService.ACTION_STOP_VPN
+                        }
+                        
+                        val stopped = stopService(serviceIntent)
+                        Log.d("MainActivity", "Normal stopService returned: $stopped")
+                        
+                        // Método 2: Usar broadcast para detención forzada
+                        Log.d("MainActivity", "Sending force stop broadcast")
+                        val forceStopIntent = Intent(MyVpnService.ACTION_FORCE_STOP_VPN).apply {
+                            setPackage(packageName)
+                        }
+                        sendBroadcast(forceStopIntent)
+                        
+                        // Método 3: Intentar detener cualquier servicio VPN activo
+                        Log.d("MainActivity", "Attempting to stop any active VPN service")
+                        try {
+                            val vpnServiceIntent = Intent(this, MyVpnService::class.java)
+                            val stoppedAny = stopService(vpnServiceIntent)
+                            Log.d("MainActivity", "Stop any service returned: $stoppedAny")
+                        } catch (e: Exception) {
+                            Log.w("MainActivity", "Error in fallback stop", e)
+                        }
+                        
+                        result.success(true)
+                    } catch (e: Exception) {
+                        Log.e("MainActivity", "Error stopping VPN service", e)
+                        result.error("STOP_ERROR", "Failed to stop VPN service", e.message)
+                    }
                 }
                 "testTraffic" -> {
                     Log.d("MainActivity", "Testing traffic by generating simulated IN packet")

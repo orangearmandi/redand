@@ -4,7 +4,10 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -22,6 +25,7 @@ class MyVpnService : VpnService() {
 
     @Volatile private var running = false
     private var thread: Thread? = null
+    @Volatile private var isServiceStopping = false
 
     private var tunInterface: ParcelFileDescriptor? = null
     private var inputStream: FileInputStream? = null
@@ -36,7 +40,14 @@ class MyVpnService : VpnService() {
     private var sessionName = "RedAnd Sniffer"
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.d(TAG, "onStartCommand called")
+        Log.d(TAG, "onStartCommand called with intent: ${intent?.action}, flags: $flags, startId: $startId")
+
+        // Verificar si es una acción de parada
+        if (intent?.action == ACTION_STOP_VPN) {
+            Log.d(TAG, "Received stop action, shutting down service")
+            forceStopService()
+            return START_NOT_STICKY
+        }
 
         intent?.let {
             bufferSize = it.getIntExtra("bufferSize", 65535).coerceIn(1500, 65535)
@@ -52,7 +63,7 @@ class MyVpnService : VpnService() {
 
         if (running) {
             Log.d(TAG, "Service already running")
-            return START_STICKY
+            return START_NOT_STICKY
         }
 
         running = true
@@ -60,7 +71,47 @@ class MyVpnService : VpnService() {
 
         thread = Thread { runVpnLoop() }.apply { name = "RedAndVpnThread"; start() }
 
-        return START_STICKY
+        return START_NOT_STICKY
+    }
+
+    private fun forceStopService() {
+        Log.d(TAG, "forceStopService called - INITIATING IMMEDIATE TERMINATION")
+        
+        // Detener inmediatamente el foreground
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        
+        // Forzar la terminación
+        isServiceStopping = true
+        running = false
+        
+        // **CLAVE: Cerrar el TUN primero para desbloquear la lectura**
+        forceCloseTun()
+        
+        // Esperar brevemente para que el hilo responda al cierre
+        try {
+            Thread.sleep(200)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during sleep", e)
+        }
+        
+        // Forzar interrupción del hilo
+        thread?.interrupt()
+        
+        // Cerrar recursos restantes
+        cleanupTun()
+        
+        // Esperar a que el hilo termine
+        try {
+            thread?.join(1000) // Esperar 1 segundo
+            if (thread?.isAlive == true) {
+                Log.w(TAG, "Thread still alive after 1s, continuing anyway")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error waiting for thread", e)
+        }
+        
+        // Detener el servicio
+        stopSelf()
     }
 
     private fun startForegroundCompat() {
@@ -96,6 +147,7 @@ class MyVpnService : VpnService() {
 
     private fun runVpnLoop() {
         Log.d(TAG, "runVpnLoop started")
+        Log.d(TAG, "Service running state: $running, thread interrupted: ${Thread.currentThread().isInterrupted}, stopping: $isServiceStopping")
 
         try {
             val builder = Builder()
@@ -119,15 +171,35 @@ class MyVpnService : VpnService() {
 
             val buffer = ByteArray(bufferSize)
 
-            while (running) {
+            while (running && !Thread.currentThread().isInterrupted && !isServiceStopping) {
                 val length = try {
                     inputStream!!.read(buffer)
                 } catch (e: IOException) {
-                    if (running) Log.e(TAG, "Error reading TUN", e)
+                    // Verificar si el error es porque el TUN fue cerrado
+                    if (e.message?.contains("closed") == true || !running || isServiceStopping) {
+                        Log.d(TAG, "TUN closed or service stopping, exiting gracefully: ${e.message}")
+                    } else {
+                        Log.e(TAG, "Error reading TUN", e)
+                    }
+                    break
+                } catch (e: InterruptedException) {
+                    Log.d(TAG, "Thread interrupted during read")
+                    break
+                } catch (e: Exception) {
+                    Log.e(TAG, "Unexpected error reading TUN", e)
                     break
                 }
 
-                if (length <= 0) continue
+                if (length <= 0) {
+                    Log.d(TAG, "Read returned length <= 0: $length")
+                    continue
+                }
+                
+                // Verificar estado después de cada lectura
+                if (!running || isServiceStopping || Thread.currentThread().isInterrupted) {
+                    Log.d(TAG, "Service stopping after read, breaking")
+                    break
+                }
 
                 val packetInfo = parseIpv4Packet(buffer, length) ?: continue
 
@@ -156,11 +228,44 @@ class MyVpnService : VpnService() {
     }
 
     private fun cleanupTun() {
-        try { inputStream?.close() } catch (_: Exception) {}
-        inputStream = null
-
-        try { tunInterface?.close() } catch (_: Exception) {}
-        tunInterface = null
+        try {
+            Log.d(TAG, "Starting TUN cleanup")
+            
+            // Cerrar input stream PRIMERO para desbloquear la lectura
+            inputStream?.close()
+            inputStream = null
+            
+            // Pequeña pausa para que el cierre tenga efecto
+            Thread.sleep(100)
+            
+            // Cerrar TUN interface
+            tunInterface?.close()
+            tunInterface = null
+            
+            Log.d(TAG, "TUN cleanup completed")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error cleaning up TUN", e)
+        }
+    }
+    
+    private fun forceCloseTun() {
+        Log.d(TAG, "Force closing TUN to unblock thread")
+        try {
+            // Cerrar el input stream primero (esto debería causar IOException en read())
+            inputStream?.close()
+            inputStream = null
+            
+            // Esperar un momento
+            Thread.sleep(50)
+            
+            // Cerrar el TUN interface
+            tunInterface?.close()
+            tunInterface = null
+            
+            Log.d(TAG, "TUN force closed")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error force closing TUN", e)
+        }
     }
 
     private fun parseIpv4Packet(buffer: ByteArray, length: Int): Map<String, Any>? {
@@ -232,15 +337,68 @@ class MyVpnService : VpnService() {
     }
 
     override fun onDestroy() {
-        Log.d(TAG, "onDestroy called")
+        Log.d(TAG, "onDestroy called - starting service shutdown sequence")
+        isServiceStopping = true
         running = false
+        
+        try {
+            unregisterReceiver(stopReceiver)
+            Log.d(TAG, "StopReceiver unregistered")
+        } catch (e: Exception) {
+            Log.w(TAG, "Error unregistering receiver", e)
+        }
+        
+        stopForeground(STOP_FOREGROUND_REMOVE)
         cleanupTun()
+        
+        // Interrumpir el hilo
         thread?.interrupt()
+        
+        // Esperar a que el hilo termine con timeout
+        try {
+            thread?.join(2000) // Esperar hasta 2 segundos
+            if (thread?.isAlive == true) {
+                Log.w(TAG, "Thread still alive after interrupt, forcing stop")
+                // Forzar la parada del hilo como último recurso
+                thread?.stop()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error waiting for thread to finish", e)
+        }
+        
         thread = null
+        isServiceStopping = false
+        Log.d(TAG, "onDestroy completed - service fully stopped")
         super.onDestroy()
     }
 
     companion object {
         private const val TAG = "MyVpnService"
+        const val ACTION_STOP_VPN = "com.example.redand.STOP_VPN"
+        const val ACTION_FORCE_STOP_VPN = "com.example.redand.FORCE_STOP_VPN"
+    }
+
+    private val stopReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            Log.d(TAG, "StopReceiver received: ${intent.action}")
+            when (intent.action) {
+                ACTION_FORCE_STOP_VPN -> {
+                    Log.d(TAG, "Force stop received - terminating service immediately")
+                    forceStopService()
+                }
+            }
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        Log.d(TAG, "onCreate called")
+        
+        // Registrar el broadcast receiver
+        val filter = IntentFilter().apply {
+            addAction(ACTION_FORCE_STOP_VPN)
+        }
+        registerReceiver(stopReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        Log.d(TAG, "StopReceiver registered")
     }
 }
