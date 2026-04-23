@@ -56,6 +56,8 @@ class MainActivity : FlutterActivity() {
                     val routePrefixLength = call.argument<Int>("routePrefixLength") ?: 0
                     val sessionName = call.argument<String>("sessionName") ?: "RedAnd VPN"
 
+                    val allowIn = call.argument<Boolean>("allowIn") ?: true
+                    val allowOut = call.argument<Boolean>("allowOut") ?: true
                     val intent = VpnService.prepare(this)
                     if (intent != null) {
                         Log.d("MainActivity", "VPN prepare intent not null, starting activity")
@@ -70,6 +72,8 @@ class MainActivity : FlutterActivity() {
                             putExtra("routeAddress", routeAddress)
                             putExtra("routePrefixLength", routePrefixLength)
                             putExtra("sessionName", sessionName)
+                            putExtra("allowIn", allowIn)
+                            putExtra("allowOut", allowOut)
                         }
                         ContextCompat.startForegroundService(this, serviceIntent)
                     }

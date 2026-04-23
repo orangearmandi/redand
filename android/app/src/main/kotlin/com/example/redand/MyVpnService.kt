@@ -3,250 +3,225 @@ package com.example.redand
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Intent
-import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
+import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import java.io.FileInputStream
-import java.io.FileOutputStream
+import java.io.IOException
 import java.net.InetAddress
-
 
 class MyVpnService : VpnService() {
 
-    // Permisos de tráfico
+    // Traffic permissions (logical filtering)
     private var allowIn = true
     private var allowOut = true
 
-    private var running = false
+    @Volatile private var running = false
     private var thread: Thread? = null
+
+    private var tunInterface: ParcelFileDescriptor? = null
     private var inputStream: FileInputStream? = null
-    private var outputStream: FileOutputStream? = null
 
     // VPN Configuration parameters
-private var bufferSize = 65535              // Máximo tamaño de paquete IP
-private var vpnAddress = "10.0.0.2"         // IP virtual del TUN
-private var vpnPrefixLength = 32            // IMPORTANTE: solo esta IP (no red completa)
-private var dnsServer = "8.8.8.8"           // DNS (puedes cambiarlo)
-private var routeAddress = "0.0.0.0"        // Captura todo el tráfico
-private var routePrefixLength = 0           // 0 = todo (default route)
-private var sessionName = "RedAnd Sniffer"
+    private var bufferSize = 65535
+    private var vpnAddress = "10.0.0.2"
+    private var vpnPrefixLength = 32
+    private var dnsServer = "8.8.8.8"
+    private var routeAddress = "0.0.0.0"
+    private var routePrefixLength = 0
+    private var sessionName = "RedAnd Sniffer"
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.d("MyVpnService", "onStartCommand called")
+        Log.d(TAG, "onStartCommand called")
 
-        // Read configuration from intent
         intent?.let {
-            bufferSize = it.getIntExtra("bufferSize", 32767)
+            bufferSize = it.getIntExtra("bufferSize", 65535).coerceIn(1500, 65535)
             vpnAddress = it.getStringExtra("vpnAddress") ?: "10.0.0.2"
-            vpnPrefixLength = it.getIntExtra("vpnPrefixLength", 24)
+            vpnPrefixLength = it.getIntExtra("vpnPrefixLength", 32).coerceIn(0, 32)
             dnsServer = it.getStringExtra("dnsServer") ?: "8.8.8.8"
             routeAddress = it.getStringExtra("routeAddress") ?: "0.0.0.0"
-            routePrefixLength = it.getIntExtra("routePrefixLength", 0)
-            sessionName = it.getStringExtra("sessionName") ?: "RedAnd VPN"
-            // Permisos de tráfico (entrada/salida)
+            routePrefixLength = it.getIntExtra("routePrefixLength", 0).coerceIn(0, 32)
+            sessionName = it.getStringExtra("sessionName") ?: "RedAnd Sniffer"
             allowIn = it.getBooleanExtra("allowIn", true)
             allowOut = it.getBooleanExtra("allowOut", true)
         }
 
-        Log.d("MyVpnService", "Configuration: bufferSize=$bufferSize, vpnAddress=$vpnAddress, sessionName=$sessionName")
-
-        if (!running) {
-            running = true
-            startForeground()
-            thread = Thread { runVpn() }
-            thread?.start()
-        } else {
-            Log.d("MyVpnService", "Service already running")
+        if (running) {
+            Log.d(TAG, "Service already running")
+            return START_STICKY
         }
+
+        running = true
+        startForegroundCompat()
+
+        thread = Thread { runVpnLoop() }.apply { name = "RedAndVpnThread"; start() }
+
         return START_STICKY
     }
 
-    private fun startForeground() {
+    private fun startForegroundCompat() {
         val channelId = "vpn_channel"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(channelId, "VPN Service", NotificationManager.IMPORTANCE_LOW)
+            val channel = NotificationChannel(
+                channelId,
+                "VPN Service",
+                NotificationManager.IMPORTANCE_LOW
+            )
             val manager = getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(channel)
         }
+
+        val openAppIntent = Intent(this, MainActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            openAppIntent,
+            (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
+        )
+
         val notification: Notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("VPN Active")
-            .setContentText("Monitoring network traffic")
-            .setSmallIcon(android.R.drawable.ic_secure) // Use a default icon
+            .setContentText("Capturing packets (no forwarding)")
+            .setSmallIcon(android.R.drawable.ic_secure)
+            .setContentIntent(pendingIntent)
+            .setOngoing(true)
             .build()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
-            startForeground(1, notification)
-        }
+
+        startForeground(1, notification)
     }
 
-    private fun runVpn() {
-        Log.d("MyVpnService", "runVpn started")
+    private fun runVpnLoop() {
+        Log.d(TAG, "runVpnLoop started")
 
-        val builder = Builder()
-            .addAddress(vpnAddress, vpnPrefixLength)
-            .addDnsServer(dnsServer)
-            .addRoute(routeAddress, routePrefixLength)
+        try {
+            val builder = Builder()
+                .setSession(sessionName)
+                .addAddress(vpnAddress, vpnPrefixLength)
+                .addDnsServer(dnsServer)
+                .addRoute(routeAddress, routePrefixLength)
 
-        val iface = builder.setSession(sessionName).establish()
+            // If you want to exclude your own app from VPN capture:
+            // builder.addDisallowedApplication(packageName)
 
-        if (iface == null) {
-            Log.e("MyVpnService", "Failed to establish VPN interface")
-            return
-        }
+            tunInterface = builder.establish()
+            if (tunInterface == null) {
+                Log.e(TAG, "Failed to establish VPN interface")
+                running = false
+                stopSelf()
+                return
+            }
 
-        Log.d("MyVpnService", "VPN interface established")
+            inputStream = FileInputStream(tunInterface!!.fileDescriptor)
 
-        inputStream = FileInputStream(iface.fileDescriptor)   // Paquetes entrantes
-        outputStream = FileOutputStream(iface.fileDescriptor) // Paquetes salientes
+            val buffer = ByteArray(bufferSize)
 
-        val buffer = ByteArray(bufferSize)
-
-
-        while (running) {
-            try {
-                val length = inputStream?.read(buffer) ?: -1
-                if (length > 0) {
-                    val packetInfo = parseIpPacket(buffer, length)
-                    var allow = true
-                    if (packetInfo != null) {
-                        val src = packetInfo["source"] as? String ?: ""
-                        val dst = packetInfo["destination"] as? String ?: ""
-                        val protocol = packetInfo["protocol"] as? Int ?: -1
-                        // Determinar dirección
-                        val isOutgoing = src == vpnAddress
-                        val isIncoming = dst == vpnAddress
-                        // Permitir según configuración
-                        allow = (isOutgoing && allowOut) || (isIncoming && allowIn)
-                        Log.d("MyVpnService", "Packet direction: ${if (isOutgoing) "OUT" else if (isIncoming) "IN" else "UNK"}, allow=$allow")
-                        if (allow) {
-                            MainActivity.sendPacketInfo(packetInfo)
-                        }
-                    }
-                    // Si no está permitido, descartar el paquete
-                    if (allow) {
-                        // Aquí podrías reenviar el paquete si implementas forwarding
-                        // outputStream?.write(buffer, 0, length)
-                    }
-                } else if (length == -1) {
-                    // Stream closed
+            while (running) {
+                val length = try {
+                    inputStream!!.read(buffer)
+                } catch (e: IOException) {
+                    if (running) Log.e(TAG, "Error reading TUN", e)
                     break
                 }
-            } catch (e: Exception) {
-                Log.e("MyVpnService", "Error reading packet", e)
-                break
-            }
-        }
 
-        inputStream?.close()
-        outputStream?.close()
-        inputStream = null
-        outputStream = null
+                if (length <= 0) continue
+
+                val packetInfo = parseIpv4Packet(buffer, length) ?: continue
+
+                // NOTE: "IN/OUT" is not reliably inferable just by comparing to vpnAddress.
+                // We'll keep a best-effort heuristic, but don't rely on it for correctness.
+                val src = packetInfo["source"] as String
+                val dst = packetInfo["destination"] as String
+                val isFromDevice = src != vpnAddress && dst != vpnAddress
+                // Heuristic: treat packets whose src is NOT the TUN IP as "OUT"
+                // (in practice TUN traffic is mostly "outgoing" from apps)
+                val allow = when {
+                    isFromDevice -> allowOut
+                    else -> allowIn || allowOut
+                }
+
+                if (allow) {
+                    MainActivity.sendPacketInfo(packetInfo)
+                }
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "Fatal error in VPN loop", t)
+        } finally {
+            cleanupTun()
+            Log.d(TAG, "runVpnLoop finished")
+        }
     }
 
-    private fun parseIpPacket(buffer: ByteArray, length: Int): Map<String, Any>? {
-        if (length < 20) return null // Header mínimo
+    private fun cleanupTun() {
+        try { inputStream?.close() } catch (_: Exception) {}
+        inputStream = null
 
-        val ihl = (buffer[0].toInt() and 0xF) * 4
-        val version = (buffer[0].toInt() shr 4) and 0xF
-        if (version != 4) return null // Solo IPv4 por ahora
+        try { tunInterface?.close() } catch (_: Exception) {}
+        tunInterface = null
+    }
 
-        val tos = buffer[1].toInt() and 0xFF
+    private fun parseIpv4Packet(buffer: ByteArray, length: Int): Map<String, Any>? {
+        if (length < 20) return null
+
+        val vihl = buffer[0].toInt() and 0xFF
+        val version = (vihl ushr 4) and 0x0F
+        if (version != 4) return null
+
+        val ihl = (vihl and 0x0F) * 4
+        if (ihl < 20 || length < ihl) return null
+
         val totalLength = ((buffer[2].toInt() and 0xFF) shl 8) or (buffer[3].toInt() and 0xFF)
-        val id = ((buffer[4].toInt() and 0xFF) shl 8) or (buffer[5].toInt() and 0xFF)
-        val flags = (buffer[6].toInt() and 0xE0) shr 5
-        val fragmentOffset = ((buffer[6].toInt() and 0x1F) shl 8) or (buffer[7].toInt() and 0xFF)
+        // totalLength can be smaller than the read length; clamp
+        val effectiveLength = minOf(length, totalLength.coerceAtLeast(ihl))
+
         val ttl = buffer[8].toInt() and 0xFF
         val protocol = buffer[9].toInt() and 0xFF
-        val checksum = ((buffer[10].toInt() and 0xFF) shl 8) or (buffer[11].toInt() and 0xFF)
+
         val sourceIp = InetAddress.getByAddress(byteArrayOf(buffer[12], buffer[13], buffer[14], buffer[15])).hostAddress
         val destIp = InetAddress.getByAddress(byteArrayOf(buffer[16], buffer[17], buffer[18], buffer[19])).hostAddress
 
-        val sourceHost = try {
-            InetAddress.getByName(sourceIp).hostName
-        } catch (e: Exception) {
-            ""
-        }
-        val destHost = try {
-            InetAddress.getByName(destIp).hostName
-        } catch (e: Exception) {
-            ""
-        }
-
         val result = mutableMapOf<String, Any>(
-            "version" to version,
+            "version" to 4,
             "ihl" to ihl,
-            "tos" to tos,
             "totalLength" to totalLength,
-            "id" to id,
-            "flags" to flags,
-            "fragmentOffset" to fragmentOffset,
             "ttl" to ttl,
             "protocol" to protocol,
-            "checksum" to checksum,
             "source" to sourceIp,
-            "sourceHost" to sourceHost,
             "destination" to destIp,
-            "destHost" to destHost,
-            "length" to length,
+            "length" to effectiveLength,
             "timestamp" to System.currentTimeMillis()
         )
 
-        var payloadOffset = ihl
-
-        if (protocol == 6 && length >= ihl + 20) { // TCP
-            val tcpOffset = ihl
-            val sourcePort = ((buffer[tcpOffset].toInt() and 0xFF) shl 8) or (buffer[tcpOffset + 1].toInt() and 0xFF)
-            val destPort = ((buffer[tcpOffset + 2].toInt() and 0xFF) shl 8) or (buffer[tcpOffset + 3].toInt() and 0xFF)
-            val seq = ((buffer[tcpOffset + 4].toLong() and 0xFF) shl 24) or ((buffer[tcpOffset + 5].toLong() and 0xFF) shl 16) or ((buffer[tcpOffset + 6].toLong() and 0xFF) shl 8) or (buffer[tcpOffset + 7].toLong() and 0xFF)
-            val ack = ((buffer[tcpOffset + 8].toLong() and 0xFF) shl 24) or ((buffer[tcpOffset + 9].toLong() and 0xFF) shl 16) or ((buffer[tcpOffset + 10].toLong() and 0xFF) shl 8) or (buffer[tcpOffset + 11].toLong() and 0xFF)
-            val dataOffset = ((buffer[tcpOffset + 12].toInt() and 0xF0) shr 4) * 4
-            val flags = buffer[tcpOffset + 13].toInt() and 0x3F
-            val window = ((buffer[tcpOffset + 14].toInt() and 0xFF) shl 8) or (buffer[tcpOffset + 15].toInt() and 0xFF)
-            val tcpChecksum = ((buffer[tcpOffset + 16].toInt() and 0xFF) shl 8) or (buffer[tcpOffset + 17].toInt() and 0xFF)
-            val urgentPointer = ((buffer[tcpOffset + 18].toInt() and 0xFF) shl 8) or (buffer[tcpOffset + 19].toInt() and 0xFF)
+        // Transport headers
+        if (protocol == 6 && effectiveLength >= ihl + 20) { // TCP
+            val off = ihl
+            val sourcePort = ((buffer[off].toInt() and 0xFF) shl 8) or (buffer[off + 1].toInt() and 0xFF)
+            val destPort = ((buffer[off + 2].toInt() and 0xFF) shl 8) or (buffer[off + 3].toInt() and 0xFF)
             result["sourcePort"] = sourcePort
             result["destPort"] = destPort
-            result["seq"] = seq
-            result["ack"] = ack
-            result["tcpDataOffset"] = dataOffset
-            result["tcpFlags"] = flags
-            result["window"] = window
-            result["tcpChecksum"] = tcpChecksum
-            result["urgentPointer"] = urgentPointer
-        } else if (protocol == 17 && length >= ihl + 8) { // UDP
-            val udpOffset = ihl
-            val sourcePort = ((buffer[udpOffset].toInt() and 0xFF) shl 8) or (buffer[udpOffset + 1].toInt() and 0xFF)
-            val destPort = ((buffer[udpOffset + 2].toInt() and 0xFF) shl 8) or (buffer[udpOffset + 3].toInt() and 0xFF)
-            val udpLength = ((buffer[udpOffset + 4].toInt() and 0xFF) shl 8) or (buffer[udpOffset + 5].toInt() and 0xFF)
-            val udpChecksum = ((buffer[udpOffset + 6].toInt() and 0xFF) shl 8) or (buffer[udpOffset + 7].toInt() and 0xFF)
+        } else if (protocol == 17 && effectiveLength >= ihl + 8) { // UDP
+            val off = ihl
+            val sourcePort = ((buffer[off].toInt() and 0xFF) shl 8) or (buffer[off + 1].toInt() and 0xFF)
+            val destPort = ((buffer[off + 2].toInt() and 0xFF) shl 8) or (buffer[off + 3].toInt() and 0xFF)
             result["sourcePort"] = sourcePort
             result["destPort"] = destPort
-            result["udpLength"] = udpLength
-            result["udpChecksum"] = udpChecksum
-        } else if (protocol == 1 && length >= ihl + 4) { // ICMP
-            val icmpOffset = ihl
-            val type = buffer[icmpOffset].toInt() and 0xFF
-            val code = buffer[icmpOffset + 1].toInt() and 0xFF
-            val icmpChecksum = ((buffer[icmpOffset + 2].toInt() and 0xFF) shl 8) or (buffer[icmpOffset + 3].toInt() and 0xFF)
-            result["icmpType"] = type
-            result["icmpCode"] = code
-            result["icmpChecksum"] = icmpChecksum
-            payloadOffset = ihl + 4
         }
 
-        // Extract payload (first 256 bytes max for performance)
+        // Payload preview (hex) limited
+        val payloadOffset = ihl
         val maxPayloadBytes = 256
-        if (length > payloadOffset) {
-            val payloadLength = minOf(length - payloadOffset, maxPayloadBytes)
-            val payload = ByteArray(payloadLength)
-            System.arraycopy(buffer, payloadOffset, payload, 0, payloadLength)
-            result["payload"] = payload.joinToString("") { String.format("%02X", it) }
+        if (effectiveLength > payloadOffset) {
+            val payloadLength = minOf(effectiveLength - payloadOffset, maxPayloadBytes)
+            val sb = StringBuilder(payloadLength * 2)
+            for (i in 0 until payloadLength) {
+                sb.append(String.format("%02X", buffer[payloadOffset + i]))
+            }
+            result["payload"] = sb.toString()
             result["payloadLength"] = payloadLength
-            result["hasMorePayload"] = (length - payloadOffset) > maxPayloadBytes
+            result["hasMorePayload"] = (effectiveLength - payloadOffset) > maxPayloadBytes
         } else {
             result["payload"] = ""
             result["payloadLength"] = 0
@@ -257,17 +232,15 @@ private var sessionName = "RedAnd Sniffer"
     }
 
     override fun onDestroy() {
-        Log.d("MyVpnService", "onDestroy called")
+        Log.d(TAG, "onDestroy called")
         running = false
+        cleanupTun()
         thread?.interrupt()
-        try {
-            inputStream?.close()
-            outputStream?.close()
-        } catch (e: Exception) {
-            Log.e("MyVpnService", "Error closing streams", e)
-        }
-        inputStream = null
-        outputStream = null
+        thread = null
         super.onDestroy()
+    }
+
+    companion object {
+        private const val TAG = "MyVpnService"
     }
 }
