@@ -1,14 +1,6 @@
 # RedAnd - Mobile Passive Network Auditor
 
-<p align="center">
-  <img src="docs/logo.png" alt="RedAnd Logo" width="180"/>
-</p>
 
-<p align="center">
-A cross-platform mobile application for passive network auditing based on Flutter and Android VPNService.
-</p>
-
----
 
 ## Overview
 
