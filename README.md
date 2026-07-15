@@ -118,21 +118,6 @@ lib/
 
 ---
 
-## Screenshots
-
-| VPN Status | Packet Monitor |
-|------------|----------------|
-| Screenshot | Screenshot |
-
-| Network Information | Ping |
-|--------------------|------|
-| Screenshot | Screenshot |
-
-| mDNS Discovery | Socket Test |
-|---------------|-------------|
-| Screenshot | Screenshot |
-
----
 
 ## Requirements
 
